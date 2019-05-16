@@ -1,0 +1,762 @@
+---
+title: "Clustering all data"
+author: "Zhiyuan Hu"
+date: "16/05/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(SingleCellExperiment) #1.4.1
+library(scater)#1.10.1
+library(edgeR) #3.24.3
+library(limma) #3.38.3
+library(dplyr) #0.7.8
+library(scales)
+library(reshape2)
+
+# source("https://bioconductor.org/biocLite.R")
+# biocLite("scater")
+# biocLite("SingleCellExperiment")
+```
+
+## Clincluster
+
+```{r}
+sceset <- readRDS("../../preprocess_data/clean data/rds/SingleCellExperimentObject_sc01tosc13_afterQC.rds")
+sceset <- sceset[,sceset$description == "cell"]
+# sceset <- sceset[,sceset$Patient != "15066L"]
+```
+
+#### Scale and centred data
+
+```{r}
+source("clincluster/clincluster_functions.R")
+sceset@colData$source2 <- plyr::mapvalues(x = sceset$source, from = unique(sceset@colData$source), to = c("cryo","fresh","longC", "onC","longC"))
+sceset <- PrepareData(sceset, col.for.cluster = "source2", do.scale = T)
+```
+
+#### High variable genes
+
+Select the high variance gene
+
+```{r}
+sceset <- HighVarGenes(sceset, verbose = T, mean.high.cutoff = 6, mean.low.cutoff = 0.3, dispersion.low.cutoff = 1, dispersion.high.cutoff = 7.5) 
+```
+
+```{r}
+table(rowData(sceset)$high.var)
+```
+
+```{r}
+df_plot <- data.frame(gene.mean = rowData(sceset)$gene.mean,
+                      gene.dispersion.scaled = rowData(sceset)$gene.dispersion.scaled,
+                      gene.dispersion = rowData(sceset)$gene.dispersion,
+                      high.var = rowData(sceset)$high.var)
+ggplot(data = df_plot , aes(x = gene.mean, y = gene.dispersion.scaled, col = high.var) ) +
+      geom_point(alpha=0.4) +  geom_hline(yintercept = 1, alpha = 0.5, col = "grey" ) +
+      geom_vline(xintercept = 0.3, alpha = 0.5, col = "grey" ) + 
+    geom_vline(xintercept = 6, alpha = 0.5, col = "grey")
+```
+
+
+The high variance genes
+
+```{r}
+ggplot(data = df_plot, aes(x = gene.mean, y = gene.dispersion, col = high.var) ) +
+      geom_point(alpha=0.4) 
+```
+
+
+#### Run tSNE
+
+```{r}
+set.seed(12345)
+sceset <- runTSNE(object = sceset, ncomponents = 2, feature_set = rownames(sceset)[rowData(sceset)$high.var],
+                  exprs_values = "logcounts",
+                  perplexity = min(50, floor(ncol(sceset)/5)))
+```
+
+```{r}
+plotTSNE(sceset)
+```
+
+
+The tSNE from log-transformed data is better then the centred data.
+
+```{r}
+p1 <- plotTSNE(sceset, colour_by = "source")
+p2 <- plotTSNE(sceset, colour_by = "Patient2")
+cowplot::plot_grid(p1,p2)
+```
+
+
+#### Calculate the first 20 PCs
+
+Calculate 20 PCs from high variance genes and the log-transformed counts.
+
+```{r runPCA}
+sceset <- runPCA(object = sceset, ncomponents = 20, exprs_values = "logcounts", rand_seed = 12345,
+                    feature_set = rownames(sceset)[rowData(sceset)$high.var == TRUE])
+```
+
+```{r}
+plot(1:20, attr(sceset@reducedDims$PCA, "percentVar")[1:20])
+```
+
+
+## Initial clustering
+
+### Cluster each group seperately
+
+```{r}
+table(sceset$group.for.cluster)
+```
+
+
+```{r initial.clustering}
+sceset <- InitialCluster(sceset, k = 6, ncomponents = 1:12, n.neighbor = 7)
+```
+
+```{r}
+plotTSNE(sceset, colour_by = "initial.cluster")
+```
+
+```{r tsne initial clusters}
+p1 <- plotTSNE(sceset[,sceset$source2 == "fresh"], colour_by = "initial.cluster")
+p2 <- plotTSNE(sceset[,sceset$source2 == "cryo"], colour_by = "initial.cluster")
+p3 <- plotTSNE(sceset[,sceset$source2 == "longC"], colour_by = "initial.cluster")
+p4 <- plotTSNE(sceset[,sceset$source2 == "onC"], colour_by = "initial.cluster")
+cowplot::plot_grid(p1,p2,p3,p4)
+```
+
+## Limma
+
+#### Remove low expressed genes
+
+```{r}
+matrix <- expm1(logcounts(sceset))
+keep <- rowSums(matrix > 1) > 5
+sum(keep)
+```
+
+```{r}
+dge <- edgeR::DGEList(counts = matrix[keep,]) # make a edgeR object
+rm(matrix,keep)
+sceset@colData$initial.cluster <- gsub(pattern = " ", replacement = "_", x = sceset@colData$initial.cluster)
+sceset@colData$initial.cluster <- gsub(pattern = "-", replacement = "_", x = sceset@colData$initial.cluster)
+design <- model.matrix(~  0 + initial.cluster, data = sceset@colData)  # Use 0 because we do not need intercept for this linear model
+colnames(design)
+```
+
+#### voom
+
+```{r}
+# Transform count data to log2-counts per million (logCPM), estimate the mean-variance relationship and use this to compute appropriate observation-level weights. The data are then ready for linear modelling.
+v <- voom(dge, design, plot = TRUE)
+fit <- lmFit(v, design) # Linear Model for Series of Arrays
+```
+
+```{r}
+initial.clusters <- colnames(design)
+nc <- ncol(design)
+## Automating makeContrasts call in limma
+contrast_all <- gtools::permutations(v = initial.clusters, n = nc, r = 2)
+contrast_all <- apply(contrast_all, MARGIN = 1, function(x) return(paste(x[1],"-",x[2], sep = "")))
+cont.matrix <- makeContrasts(contrasts = contrast_all,
+                             levels=design)
+head(cont.matrix[,1:3])
+```
+
+```{r}
+fit2 <- contrasts.fit(fit, cont.matrix) # Compute Contrasts from Linear Model Fit
+fit2 <- eBayes(fit2) #Empirical Bayes Statistics for Differential Expression
+# Given a microarray linear model fit, compute moderated t-statistics, moderated F-statistic, and log-odds of differential expression by empirical Bayes moderation of the standard errors towards a common value.
+```
+
+## DE matrix
+
+```{r}
+n_deg <- matrix(0, ncol = nc, nrow = nc)  # number of DE genes
+colnames(n_deg) <- rownames(n_deg) <- gsub(x = colnames(design)[1:nc], pattern = "initial.cluster",replacement = "")
+
+logcount <- logcounts(sceset)[rownames(sceset) %in% rownames(dge),]
+
+for(i in 1:(nc-1)) {
+    for(j in (i+1):nc) {
+        if(i == j) {
+            n_deg[i,j] <- 0
+        } else if (j < i) {
+            coef_k = (i-1)*(nc-1)+j
+        } else if (j > i) {
+            coef_k = (i-1)*(nc-1)+j-1
+        }
+        
+        if(i != j) {
+            rls <- topTable(fit2, n = Inf, coef = coef_k, sort = "p", lfc = 0.6, p = 0.05 )
+            if(nrow(rls) > 1) {
+                v_expr <- logcount[match(rownames(rls),rownames(logcount)), sceset$initial.cluster == rownames(n_deg)[i]]
+                rls$ratio1 <- rowSums(v_expr > 0.5)/ncol(v_expr)
+                v_expr <- logcount[match(rownames(rls),rownames(logcount)), sceset$initial.cluster == colnames(n_deg)[j]]
+                rls$ratio2 <- rowSums(v_expr > 0.5)/ncol(v_expr)
+                rls$ratiomax <- rowMaxs(as.matrix(rls[,c("ratio1", "ratio2")]))
+                rls$ratiomin <- rowMins(as.matrix(rls[,c("ratio1", "ratio2")]))
+                rls <- rls[rls$ratiomax > 0.25, ]
+                n_deg[i,j] <- sum(apply(rls, MARGIN = 1, function(x) return(abs(x[1]) * (x[9]+0.01)/(x[10]+0.01)))) ## 0.01 is used here to exaggerate the differences of on-off genes
+            } else if (nrow(rls) == 1) {
+                n_deg[i,j] <- sum(rls$logFC)
+            }
+            ## This eqaution take fold change and expression ratio into account
+            ## Question: should we talk a upper limit to the weight?
+        }
+    }
+}
+
+n_deg <- n_deg + t(n_deg)
+```
+
+## Final cluster
+
+```{r}
+p1 <- plotTSNE(sceset[,sceset$source2 == "fresh"], colour_by = "initial.cluster")
+p2 <- plotTSNE(sceset[,sceset$source2 == "cryo"], colour_by = "initial.cluster")
+p3 <- plotTSNE(sceset[,sceset$source2 == "longC"], colour_by = "initial.cluster")
+p4 <- plotTSNE(sceset[,sceset$source2 == "onC"], colour_by = "initial.cluster")
+cowplot::plot_grid(p1,p2,p3,p4)
+```
+
+```{r}
+hc <- hclust(as.dist(n_deg))
+plot(hc); rect.hclust(hc, k = 12, border = "red")
+
+```
+
+
+```{r}
+hc.cluster <- cutree(hc, k = 12)
+colData(sceset)$clincluster <- hc.cluster[match(colData(sceset)$initial.cluster, names(hc.cluster))]
+colData(sceset)$clincluster <- as.factor(colData(sceset)$clincluster)
+table(colData(sceset)$clincluster )
+```
+
+```{r}
+plotTSNE(sceset,  colour_by = "clincluster")
+```
+
+```{r}
+table(sceset$source2, sceset$clincluster)
+```
+
+## Marker genes
+
+```{r}
+matrix <- expm1(logcounts(sceset))
+keep <- rowSums(matrix > 1) > 5
+dge <- edgeR::DGEList(counts = matrix[keep,]) # make a edgeR object
+
+logcount <- logcounts(sceset)[rownames(sceset) %in% rownames(dge),]
+markers <- c()
+
+pb <- txtProgressBar(min = 0, max =  (length(unique(sceset$clincluster))), style = 3)
+for(i in 1:length(unique(sceset$clincluster))){
+    info <- rep("control", ncol(sceset))
+    info[sceset$clincluster == i] <- "group"
+    design <- model.matrix(~ 0 + info)
+    v <- voom(dge, design, plot = F)
+    fit <- lmFit(v, design) # Linear Model for Series of Arrays
+    cont.matrix <- makeContrasts(contrasts = "infogroup-infocontrol",levels=design)
+    fit <- contrasts.fit(fit, cont.matrix ) # Linear Model for Series of Arrays
+    fit <- eBayes(fit)
+    
+    marker <- topTable(fit, p.value = 0.05, number = Inf, coef = 1, lfc = 0.6, sort.by = "logFC")
+    marker <- marker[marker$logFC > 0.6,]
+     
+     v_expr <- logcount[match(rownames(marker),rownames(logcount)), info == "group"]
+     marker$ratio1 <- rowSums(v_expr > 0.5)/ncol(v_expr)
+     v_expr <- logcount[match(rownames(marker),rownames(logcount)),info != "group"]
+     marker$ratio2 <- rowSums(v_expr > 0.5)/ncol(v_expr)
+                
+    marker$gene <- rownames(marker) 
+    marker$cluster <- i
+    markers  <- rbind(markers, marker)
+    setTxtProgressBar(pb, i)
+}
+close(pb)
+markers$cluster <- factor(markers$cluster)
+```
+
+```{r}
+suppressPackageStartupMessages(library(dplyr))
+top10 <- markers %>% group_by(cluster) %>% top_n(3, logFC)
+top10
+```
+
+
+```{r}
+rm(v)
+gc()
+```
+
+
+## Heatmap
+
+```{r}
+markers <- markers[rowMaxs(as.matrix(markers[,c("ratio1","ratio2")])) > 0.4,]
+    
+top10 <- markers %>% group_by(cluster) %>% top_n(10, logFC)
+plot.data <- logcounts(sceset)[top10$gene, order(sceset$clincluster, decreasing = F)]
+
+colanno <- data.frame (colData(sceset)[,c("clincluster","Patient2")])
+colnames(colanno)[1] <- "clusters"
+colanno$clusters <- factor(colanno$clusters)
+
+rownames(colanno) <- colnames(sceset)
+colanno <- colanno[order(colanno$clusters, decreasing = F),]
+colanno$clusters <- factor(colanno$clusters, levels = unique(colanno$clusters))
+plot.data <- plot.data[,match(rownames(colanno), colnames(plot.data))] 
+
+plot.data <- t(scale(t(plot.data), center = T, scale = T))
+plot.data <- Seurat::MinMax(plot.data, min = -2, max = 2)
+
+plot.data<- as.data.frame(x = t(x = plot.data))
+plot.data$cell <- rownames(x = plot.data)
+
+cells.ident <- sceset$clincluster
+names(x = cells.ident) <- sceset$Sample
+ 
+colnames(x = plot.data) <- make.unique(names = colnames(x = plot.data))
+plot.data %>% melt(id.vars = "cell") -> plot.data
+names(x = plot.data)[names(x = plot.data) == 'variable'] <- 'gene'
+names(x = plot.data)[names(x = plot.data) == 'value'] <- 'expression'
+plot.data$ident <- cells.ident[plot.data$cell]
+
+ plot.data$gene <- with(
+    data = plot.data,
+    expr = factor(x = gene, levels = rev(x = unique(x = plot.data$gene)))
+  )
+   plot.data$cell <- with(
+    data = plot.data,
+    expr = factor(x = cell, levels = unique(x = colnames(sceset)))
+  )
+
+my_colours <- colorRampPalette(c("steelblue4", "white", "firebrick2"))(200)
+
+heatmap <- ggplot( data = plot.data, mapping = aes(x = cell, y = gene, fill = expression)) + geom_tile() +
+    scale_fill_gradient2(
+        # low = muted("blue"), mid = "white", high = muted("red")
+        low = muted("steelblue4"), mid = "white",
+        high = muted("firebrick2"),
+      name= "Expression", guide = guide_colorbar(
+        direction = "vertical",
+        title.position = "top"
+      )
+    ) +
+    scale_y_discrete(position = "right", labels = rev(top10$gene)) +
+    theme(
+      axis.line = element_blank(),
+      axis.title.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      strip.text.x = element_text(size = 15),
+      axis.text.y = element_text(size = 6),
+      axis.text.x = element_text(size = 6),
+      axis.title.x = element_blank()
+    )
+
+heatmap <- heatmap +
+      facet_grid(
+        facets = ~ident,
+        drop = TRUE,
+        space = "free",
+        scales = "free",
+        switch = 'x'
+      ) +
+      scale_x_discrete(expand = c(0, 0), drop = TRUE)  +
+      theme(
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.line = element_blank(),
+        axis.title.y = element_blank(),
+        axis.ticks.y = element_blank()
+      )
+
+panel.spacing <- unit(x = 0.15, units = 'lines')
+heatmap <- heatmap +
+      theme(strip.background = element_blank(), panel.spacing = panel.spacing)
+
+
+```
+
+```{r, fig.height=8, fig.width=7}
+heatmap
+```
+
+
+## Save results
+
+```{r}
+# saveRDS(sceset,"../rds/20180917Sceset_12clusters.rds", compress = T)
+# write.csv(markers,"../tables/20180917sceset_markers_12cluster.csv", row.names = T)
+```
+
+## Figures
+
+```{r}
+plotTSNE(sceset,  colour_by = "clincluster")
+```
+
+### Figure 1C
+
+```{r}
+current.cluster.ids <- c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 ,12)
+new.cluster.ids <- c("Leukocyte", 
+                     "Cultured ciliated",
+                     "O.N. cultured FTESCs",
+                     "Cultured ciliated",
+                     "O.N. cultured FTESCs",
+                     "Stromal cells", 
+                     "Fresh FTESCs",
+                     "Fresh FTESCs",
+                     "Fresh ciliated",
+                     "Long cultured FTESCs 2", 
+                     "Long cultured FTESCs 1", 
+                     "O.N. cultured FTESCs")
+sceset$ident <- plyr::mapvalues(x = sceset$clincluster, from = current.cluster.ids, to = new.cluster.ids)
+sceset$ident <- factor(sceset$ident,
+                       levels = c("Fresh FTESCs",
+                                  "Fresh ciliated",
+                                  "O.N. cultured FTESCs",
+                                  "Cultured ciliated",
+                                  "Long cultured FTESCs 1", 
+                                  "Long cultured FTESCs 2", 
+                                  "Leukocyte",
+                                  "Stromal cells"))
+
+sceset$sources <- sceset$source
+sceset$sources[sceset$sources %in% c("2-day cultured", "6-day cultured")] <- "Long cultured" 
+sceset$sources <- factor(sceset$sources, levels = c("Fresh","O.N. cultured","cryopreserved",
+                                                    "Long cultured"))
+
+# tiff("../manuscript_plots/Figure1C_0823.tiff", res = 300, width = 8, height = 5.5, units = "in")
+# plotTSNE(object = sceset,  colour_by = "ident")
+# dev.off()
+```
+
+```{r figure1c}
+plotTSNE(object = sceset,  colour_by = "ident")
+```
+
+```{r}
+# tiff("../manuscript_plots/Figure1_0917_tSNE_ident.tiff", res = 300, width = 6, height = 4, units = "in")
+# plotTSNE(object = sceset,  colour_by = "ident")
+# dev.off()
+# 
+# tiff("../manuscript_plots/Figure1_0917_tSNE_Patient.tiff", res = 300, width = 5, height = 4, units = "in")
+# plotTSNE(object = sceset,  colour_by = "Patient2")
+# dev.off()
+# 
+# tiff("../manuscript_plots/Figure1_0917_tSNE_clincluster.tiff", res = 300, width = 5, height = 4, units = "in")
+# plotTSNE(object = sceset,  colour_by = "clincluster")
+# dev.off()
+```
+
+### Figure 1D
+
+```{r}
+top5 <- sceset.markers %>% group_by(cluster) %>% top_n(10,logFC)
+as.character(brewer.pal(9, "Set1"))
+# [1] "#A6CEE3" "#1F78B4" "#B2DF8A" "#33A02C" "#FB9A99" "#E31A1C" "#FDBF6F" "#FF7F00" "#CAB2D6" "#6A3D9A"
+# [11] "#FFFF99"
+
+ident_colours <- as.character(brewer.pal(9, "Set1"))
+# clusters_colours[12] <- "#b7a194"
+names(ident_colours) <- levels(sceset$ident)
+clusters_colours <- as.character(brewer.pal(12, "Paired"))[c(2,1,8,7,4,3,6,5,10,9,12,11)]
+clusters_colours[12] <- "#b7a194"
+names(clusters_colours) <- levels(sceset$final.clusters)
+source_colours <- as.character(brewer.pal(5, "Dark2"))
+names(source_colours) <- unique(sceset$source)
+ann_colors = list(clusters = clusters_colours,
+                  sources = source_colours,
+                  ident = ident_colours)
+
+PlotExprHeatmap(sceset, markers = top5, coldata.to.include = c("source","ident"), annotation_colors = ann_colors, use.gap = F)
+
+```
+
+```{r}
+top5
+```
+
+```{r}
+top5[,c("gene","cluster")]
+```
+
+```{r, fig.height=10, fig.width=10}
+top10 <- markers %>% group_by(cluster) %>% top_n(10, logFC)
+top10 <- top10[!duplicated(top10$gene),]
+plot.data <- logcounts(sceset)[top10$gene, order(sceset$clincluster, decreasing = F)]
+
+colanno <- data.frame (colData(sceset)[,c("clincluster","Patient2","ident")])
+colnames(colanno)[1] <- "clusters"
+colanno$clusters <- factor(colanno$clusters)
+
+rownames(colanno) <- colnames(sceset)
+colanno <- colanno[order(colanno$clusters, decreasing = F),]
+colanno <- colanno[order(colanno$ident, decreasing = F),]
+
+colanno$clusters <- factor(colanno$clusters, levels = unique(colanno$clusters))
+plot.data <- plot.data[,match(rownames(colanno), colnames(plot.data))] 
+
+plot.data <- t(scale(t(plot.data), center = T, scale = T))
+plot.data <- Seurat::MinMax(plot.data, min = -2.5, max = 2.5)
+
+cells.ident <- sceset$clincluster
+# cells.ident <- factor(cells.ident, levels = c("Fresh FTESCs",
+#                                               "O.N. cultured FTESCs",
+#                                               "Long cultured FTESCs 1",
+#                                               "Long cultured FTESCs 2",
+#                                               "Fresh ciliated",
+#                                               "Cultured ciliated",
+#                                               "Stromal cells",
+#                                               "Leukocyte"))
+names(x = cells.ident) <- sceset$Sample
+
+my_colours <- colorRampPalette(c(muted("steelblue4"), "white", muted("firebrick2")))(200)
+
+# annotation colour
+library(RColorBrewer)
+ident_colours <- as.character(brewer.pal(8, "Set1"))
+names(ident_colours) <- levels(colanno$ident)
+
+clusters_colours <- as.character(brewer.pal(12, "Paired"))[c(2,1,8,7,4,3,6,5,10,9,12,11)]
+clusters_colours[12] <- "#b7a194"
+names(clusters_colours) <- levels(colanno$clusters)
+
+source_colours <- as.character(brewer.pal(10, "Set3"))
+names(source_colours) <- unique(colanno$Patient2)
+
+ann_colors = list(clusters = clusters_colours,
+                  sources = source_colours,
+                  ident = ident_colours)
+# display.brewer.all()
+
+pheatmap::pheatmap(plot.data, my_colours, cluster_rows = F,
+                   cellwidth = 0.2,
+                   cellheight = 8,
+                   cluster_cols = F, show_colnames = F,
+                   annotation_col= colanno,
+                   annotation_colors = ann_colors)
+
+```
+
+
+```{r}
+# tiff("../manuscript_plots/Figure1D_0917_heatmap", res = 300, width = 11, height =12, units = "in")
+# pheatmap::pheatmap(plot.data, my_colours, cluster_rows = F,
+#                    cellwidth = 0.13,
+#                    cellheight = 8,
+#                    cluster_cols = F, show_colnames = F,
+#                    annotation_col= colanno,
+#                    annotation_colors = ann_colors)
+# dev.off()
+```
+
+
+```{r}
+# tiff("../manuscript_plots/Figure1D_0823.tiff", res = 300, width = 10, height = 8, units = "in")
+# PlotExprHeatmap(sceset, markers = top5, coldata.to.include = c("source","ident"), annotation_colors = ann_colors, use.gap = F)
+# dev.off()
+```
+
+## Supplementary Figure 1
+
+(A) A t-SNE plot profiling ~3,600 single-cell transcriptome from fallopian tubes coloured by patients 
+
+(B) Expression plot of secretory markers PAX8, KART7, 
+
+(C) Expression plot of ciliated markers CAPS and CCDC17.
+
+(D) Validation of CCDC17, CAPS and KRT7 by IF/IHC
+
+
+```{r}
+# # Figure S1A----
+# tiff("../manuscript_plots/FigureS1A_tsne.tiff", res = 300, width = 7, height = 5.5, units = "in")
+plotTSNE(sceset,  colour_by = "Patient2")
+# dev.off()
+# 
+# # Figure S2B----- 
+# tiff("../manuscript_plots/FigureS1A-2_EPCAM_PTPRC.tiff", res = 300, width = 9, height = 4, units = "in")
+p1 <- plotTSNE(sceset,  colour_by = "EPCAM")
+p2 <- plotTSNE(sceset,  colour_by = "PTPRC")
+cowplot::plot_grid(p1,p2)
+# dev.off()
+# 
+# # Figure S2B
+# tiff("../manuscript_plots/FigureS1B_KRT17_PAX8.tiff", res = 300, width = 9, height = 4, units = "in")
+p1 <- plotTSNE(sceset,  colour_by = "PAX8")
+p2 <- plotTSNE(sceset,  colour_by = "KRT7")
+cowplot::plot_grid(p1,p2)
+# dev.off()
+# 
+# # Figure S2C--------
+# tiff("../manuscript_plots/FigureS1C_CAPS_CCDC17_CCDC78.tiff", res = 300, width = 13.5, height = 4, units = "in")
+p1 <- plotTSNE(sceset,  colour_by = "CAPS")
+p2 <- plotTSNE(sceset,  colour_by = "CCDC17")
+p3 <-plotTSNE(sceset,  colour_by = "CCDC78")
+cowplot::plot_grid(p1,p2,p3,ncol = 3)
+# dev.off()
+```
+
+```{r}
+# sceset <- readRDS("../rds/20180917Sceset_12clusters.rds")
+# plotPCA(sceset[, sceset$clincluster == 9 & logcounts(sceset)["CAPS",] >4], colour_by = "source" )
+p1 <- plotPCA(sceset[, sceset$clincluster == 9 & logcounts(sceset)["CAPS",] >4], colour_by = "Patient2" )
+p2 <- plotPCA(sceset[, sceset$clincluster == 9 & logcounts(sceset)["CAPS",] >4], colour_by = "CCDC17" )
+p3 <- plotPCA(sceset[, sceset$clincluster == 9 & logcounts(sceset)["CAPS",] >4], colour_by = "CAPS" )
+p4 <- plotPCA(sceset[, sceset$clincluster == 9 & logcounts(sceset)["CAPS",] >4], colour_by = "KRT7" )
+cowplot::plot_grid(p1,p2,p3,p4, ncol = 2)
+```
+
+```{r}
+# tiff("../manuscript_plots/FigureS3D_intermediate.tiff", res = 200, width = 7, height = 5, units = "in")
+# cowplot::plot_grid(p1,p2,p3,p4, ncol = 2)
+# dev.off()
+```
+
+## Supp Figure 1
+
+```{r}
+fresh <- sceset[,sceset$source == "Fresh"]
+plotTSNE(fresh, colour_by = "clincluster")
+
+fresh$type <- "Secretory"
+fresh$type[fresh$ident == "Fresh ciliated"] <- "Ciliated"
+plotExpression(fresh, x = "type", features = c("KRT7","PAX8"), ncol = 5,xlab = "Cell type")  + theme(strip.text = element_text(size = 12, face = "italic") )
+
+# ggsave("plots/SuppFig1H_secretory_markers.png", height = 2, width = 3.5)
+```
+
+```{r}
+plotExpression(fresh, x = "type", features = c("CCDC17","CCDC78","CAPS"), ncol = 5,xlab = "Cell type")  + theme(strip.text = element_text(size = 12, face = "italic") )
+
+# ggsave("plots/SuppFig1I_ciliated_markers.png", height = 2, width = 4.5)
+```
+
+```{r}
+sum(logcounts(fresh)["CAPS",] > 4 & logcounts(fresh)["KRT7",] > 2)
+```
+
+## Intermediate population
+
+```{r}
+set.seed(12345)
+fresh <- runUMAP(fresh, ncomponents = 2, ntop = 500,exprs_values = "logcounts")
+plotUMAP(fresh, colour_by = "KRT7")
+```
+
+```{r}
+fresh$intermediate <- F
+fresh$intermediate[fresh$clincluster == 9 & fresh@reducedDims$UMAP[,1] < 5 & fresh@reducedDims$UMAP[,2] > 0] <- T
+
+table(paste(fresh$ident, fresh$intermediate))
+```
+
+```{r}
+fresh$ident2 <- paste(fresh$ident, fresh$intermediate)
+plotExpression(fresh, features = c("PIFO"), x = "ident2")
+```
+
+
+```{r}
+dge <- edgeR::DGEList(counts = logcounts(fresh)[rowSums(logcounts(fresh)) > 0,fresh$Patient2 %in% c(11545, 15066, 11553)  ]) # make a edgeR object
+
+design <- model.matrix(~  0 + ident2 + Patient2, data = fresh@colData[fresh$Patient2 %in% c(11545, 15066, 11553),])  # Use 0 because we do not need intercept for this linear model
+colnames(design)[1:3] <- c("cil","int","sec")
+
+v <- voom(dge, design, plot = TRUE)
+fit <- lmFit(v, design) # Linear Model for Series of Arrays
+
+cont.matrix <- makeContrasts(contrasts=c("int-sec","int-cil"),
+                             levels=colnames(design))
+```
+
+
+```{r}
+fit2 <- contrasts.fit(fit, cont.matrix) # Compute Contrasts from Linear Model Fit
+fit2 <- eBayes(fit2)
+
+rls_int_sec <- topTable(fit2, number = Inf, p.value = 0.05 , lfc = 0.5, coef = 1,sort.by = "logFC")
+rls_int_cil <- topTable(fit2, number = Inf, p.value = 0.05 , lfc = 0.5, coef = 2,sort.by = "logFC")
+rls_int_cil$gene <- rownames(rls_int_cil )
+dim(rls_int_sec)
+```
+
+```{r}
+# write.csv(rls_int_sec, "../tables/20190201_DEGs_intermediate_vs_secretory.csv")
+# write.csv(rls_int_cil, "../tables/20190201_DEGs_intermediate_vs_ciliated.csv")
+```
+
+
+```{r}
+plotExpression(fresh[,fresh$Patient2 %in% c(11545, 15066, 11553)], features = c("KRT7","CAPS","PAX8","TUBB4B","PROM1","BCAS3"), x = "ident2")
+```
+
+
+```{r}
+p1 <- plotUMAP(fresh[,logcounts(fresh)["CAPS",] > 5 & logcounts(fresh)["KRT7",] > 3], colour_by = "PIFO")+xlim(c(-4.5,14)) + ylim(c(-4.5, 3))
+p2 <- plotUMAP(fresh[,logcounts(fresh)["CAPS",] > 5 & logcounts(fresh)["KRT7",] <= 0.5], colour_by = "PIFO")+xlim(c(-4.5,14)) + ylim(c(-4.5, 3))
+cowplot::plot_grid(p1,p2)
+```
+
+## Technical
+
+```{r}
+sessionInfo()
+```
+
+R version 3.5.2 (2018-12-20)
+Platform: x86_64-apple-darwin15.6.0 (64-bit)
+Running under: macOS Mojave 10.14.4
+
+Matrix products: default
+BLAS: /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib
+LAPACK: /Library/Frameworks/R.framework/Versions/3.5/Resources/lib/libRlapack.dylib
+
+locale:
+[1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+
+attached base packages:
+ [1] grid      parallel  stats4    stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] modes_0.7.0                 ROCR_1.0-7                  gplots_3.0.1.1              KernSmooth_2.23-15          fields_9.6                  maps_3.3.0                 
+ [7] spam_2.2-2                  dotCall64_1.0-0             DoubletFinder_2.0.1         Seurat_2.3.4                Matrix_1.2-15               cowplot_0.9.4              
+[13] bindrcpp_0.2.2              reshape2_1.4.3              scales_1.0.0                dplyr_0.7.8                 edgeR_3.24.3                limma_3.38.3               
+[19] scater_1.10.1               ggplot2_3.1.0               SingleCellExperiment_1.4.1  SummarizedExperiment_1.12.0 DelayedArray_0.8.0          BiocParallel_1.16.5        
+[25] matrixStats_0.54.0          Biobase_2.42.0              GenomicRanges_1.34.0        GenomeInfoDb_1.18.1         IRanges_2.16.0              S4Vectors_0.20.1           
+[31] BiocGenerics_0.28.0        
+
+loaded via a namespace (and not attached):
+  [1] reticulate_1.10          R.utils_2.7.0            tidyselect_0.2.5         htmlwidgets_1.3          trimcluster_0.1-2.1      Rtsne_0.15               devtools_2.0.1          
+  [8] munsell_0.5.0            codetools_0.2-16         ica_1.0-2                statmod_1.4.30           scran_1.10.2             umap_0.1.0.3             withr_2.1.2             
+ [15] colorspace_1.4-0         knitr_1.21               rstudioapi_0.9.0         robustbase_0.93-3        dtw_1.20-1               gbRd_0.4-11              Rdpack_0.10-1           
+ [22] labeling_0.3             lars_1.2                 GenomeInfoDbData_1.2.0   pheatmap_1.0.12          bit64_0.9-7              rhdf5_2.26.2             rprojroot_1.3-2         
+ [29] xfun_0.4                 diptest_0.75-7           R6_2.3.0                 ggbeeswarm_0.6.0         locfit_1.5-9.1           hdf5r_1.0.1              flexmix_2.3-14          
+ [36] bitops_1.0-6             assertthat_0.2.0         SDMTools_1.1-221         nnet_7.3-12              beeswarm_0.2.3           gtable_0.2.0             npsurv_0.4-0            
+ [43] processx_3.2.1           rlang_0.3.1              splines_3.5.2            lazyeval_0.2.1           acepack_1.4.1            checkmate_1.9.1          yaml_2.2.0              
+ [50] backports_1.1.3          Hmisc_4.2-0              tools_3.5.2              usethis_1.4.0            RColorBrewer_1.1-2       proxy_0.4-22             dynamicTreeCut_1.63-1   
+ [57] sessioninfo_1.1.1        ggridges_0.5.1           kknn_1.3.1               Rcpp_1.0.0               plyr_1.8.4               base64enc_0.1-3          zlibbioc_1.28.0         
+ [64] purrr_0.3.0              RCurl_1.95-4.11          ps_1.3.0                 prettyunits_1.0.2        rpart_4.1-13             pbapply_1.4-0            viridis_0.5.1           
+ [71] zoo_1.8-4                cluster_2.0.7-1          fs_1.2.6                 magrittr_1.5             data.table_1.12.0        lmtest_0.9-36            RANN_2.6.1              
+ [78] mvtnorm_1.0-8            fitdistrplus_1.0-14      pkgload_1.0.2            evaluate_0.13            lsei_1.2-0               mclust_5.4.2             gridExtra_2.3           
+ [85] compiler_3.5.2           tibble_2.0.1             crayon_1.3.4             R.oo_1.22.0              htmltools_0.3.6          segmented_0.5-3.0        Formula_1.2-3           
+ [92] snow_0.4-3               tidyr_0.8.2              MASS_7.3-51.1            fpc_2.1-11.1             cli_1.0.1                R.methodsS3_1.7.1        gdata_2.18.0            
+ [99] metap_1.1                bindr_0.1.1              igraph_1.2.3             pkgconfig_2.0.2          foreign_0.8-71           foreach_1.4.4            vipor_0.4.5             
+[106] XVector_0.22.0           bibtex_0.4.2             stringr_1.4.0            callr_3.1.1              digest_0.6.18            tsne_0.1-3               rmarkdown_1.11          
+[113] htmlTable_1.13.1         DelayedMatrixStats_1.4.0 curl_3.3                 kernlab_0.9-27           gtools_3.8.1             modeltools_0.2-22        nlme_3.1-137            
+[120] jsonlite_1.6             Rhdf5lib_1.4.2           BiocNeighbors_1.0.0      desc_1.2.0               viridisLite_0.3.0        pillar_1.3.1             lattice_0.20-38         
+[127] httr_1.4.0               DEoptimR_1.0-8           pkgbuild_1.0.2           survival_2.43-3          glue_1.3.0               remotes_2.0.2            png_0.1-7               
+[134] prabclus_2.2-7           iterators_1.0.10         bit_1.1-14               class_7.3-15             stringi_1.2.4            HDF5Array_1.10.1         mixtools_1.1.0          
+[141] doSNOW_1.0.16            latticeExtra_0.6-28      caTools_1.17.1.1         memoise_1.1.0            irlba_2.3.3              ape_5.2       
